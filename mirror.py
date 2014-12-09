@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # Copyright 2008 Brett Slatkin
-#
+# 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+# 
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+# 
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -32,6 +32,8 @@ from google.appengine.ext.webapp import template
 from google.appengine.runtime import apiproxy_errors
 
 import transform_content
+
+import types
 
 ################################################################################
 
@@ -67,6 +69,15 @@ TRANSFORMED_CONTENT_TYPES = frozenset([
   "text/css",
 ])
 
+MIRROR_HOSTS = frozenset([
+  'mirrorr.com',
+  'mirrorrr.com',
+  'www.mirrorr.com',
+  'www.mirrorrr.com',
+  'www1.mirrorrr.com',
+  'www2.mirrorrr.com',
+  'www3.mirrorrr.com',
+])
 
 MAX_CONTENT_SIZE = 10 ** 6
 
@@ -104,18 +115,23 @@ class MirroredContent(object):
   @staticmethod
   def fetch_and_store(key_name, base_url, translated_address, mirrored_url):
     """Fetch and cache a page.
-
+    
     Args:
       key_name: Hash to use to store the cached page.
       base_url: The hostname of the page that's being mirrored.
       translated_address: The URL of the mirrored page on this site.
       mirrored_url: The URL of the original page. Hostname should match
         the base_url.
-
+    
     Returns:
       A new MirroredContent object, if the page was successfully retrieved.
       None if any errors occurred or the content could not be retrieved.
     """
+    # Check for the X-Mirrorrr header to ignore potential loops.
+    if base_url in MIRROR_HOSTS:
+      logging.warning('Encountered recursive request for "%s"; ignoring',
+                      mirrored_url)
+      return None
 
     logging.debug("Fetching '%s'", mirrored_url)
     try:
@@ -154,7 +170,7 @@ class MirroredContent(object):
     if not memcache.add(key_name, new_content, time=EXPIRATION_DELTA_SECONDS):
       logging.error('memcache.add failed: key_name = "%s", '
                     'original_url = "%s"', key_name, mirrored_url)
-
+      
     return new_content
 
 ################################################################################
@@ -205,11 +221,51 @@ class HomeHandler(BaseHandler):
     }
     self.response.out.write(template.render("main.html", context))
 
+def var_dump(obj):
+  logging.debug(dump(obj))
+
+def dump(obj):
+  '''return a printable representation of an object for debugging'''
+  newobj = obj
+  if isinstance(obj, list):
+    newobj = []
+    for item in obj:
+      newobj.append(dump(item))
+  elif isinstance(obj, tuple):
+    temp = []
+    for item in obj:
+      temp.append(dump(item))
+    newobj = tuple(temp)
+  elif isinstance(obj, set):
+    temp = []
+    for item in obj:
+      temp.append(str(dump(item)))
+    newobj = set(temp)
+  elif isinstance(obj, dict):
+    newobj = {}
+    for key, value in obj.items():
+      newobj[str(dump(key))] = dump(value)
+  elif isinstance(obj, types.FunctionType):
+    newobj = repr(obj)
+  elif '__dict__' in dir(obj):
+    newobj = obj.__dict__.copy()
+    if ' object at ' in str(obj) and not '__type__' in newobj:
+      newobj['__type__']=str(obj).replace(" object at ", " #").replace("__main__.", "")
+    for attr in newobj:
+      newobj[attr]=dump(newobj[attr])
+  return newobj
 
 class MirrorHandler(BaseHandler):
+  def options(self, base_url):
+    self.response.headers['Access-Control-Allow-Origin'] = '*'
+    self.response.headers['Access-Control-Allow-Headers'] = 'X-Titanium-Id'
+    self.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
   def get(self, base_url):
+    self.response.headers['Access-Control-Allow-Origin'] = '*'
+    self.response.headers['Access-Control-Allow-Headers'] = 'X-Titanium-Id'
+    self.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     assert base_url
-
+    
     # Log the user-agent and referrer, to see who is linking to us.
     logging.debug('User-Agent = "%s", Referrer = "%s"',
                   self.request.user_agent,
@@ -234,15 +290,20 @@ class MirrorHandler(BaseHandler):
                                                 mirrored_url)
     if content is None:
       return self.error(404)
-
+    if content.status == 404:
+      return self.error(404)
+      
+      
+    #var_dump(content)
     # Store the entry point down here, once we know the request is good and
     # there has been a cache miss (i.e., the page expired). If the referrer
     # wasn't local, or it was '/', then this is an entry point.
     if (cache_miss and
         'Googlebot' not in self.request.user_agent and
-        'Slurp' not in self.request.user_agent and
-        (not self.request.referer.startswith(self.request.host_url) or
-         self.request.referer == self.request.host_url + "/")):
+        'Slurp' not in self.request.user_agent ):
+        #and
+        #(self.request.referer != None && (not self.request.referer.startswith(self.request.host_url) or
+        # self.request.referer == self.request.host_url + "/"))):
       # Ignore favicons as entry points; they're a common browser fetch on
       # every request for a new site that we need to special case them here.
       if not self.request.url.endswith("favicon.ico"):
@@ -254,7 +315,7 @@ class MirrorHandler(BaseHandler):
           entry_point.put()
         except (db.Error, apiproxy_errors.Error):
           logging.exception("Could not insert EntryPoint")
-
+    
     for key, value in content.headers.iteritems():
       self.response.headers[key] = value
     if not DEBUG:
@@ -263,8 +324,51 @@ class MirrorHandler(BaseHandler):
 
     self.response.out.write(content.data)
 
+
+class AdminHandler(webapp2.RequestHandler):
+  def get(self):
+    self.response.headers['content-type'] = 'text/plain'
+    self.response.out.write(str(memcache.get_stats()))
+
+
+class KaboomHandler(webapp2.RequestHandler):
+  def get(self):
+    self.response.headers['content-type'] = 'text/plain'
+    self.response.out.write('Flush successful: %s' % memcache.flush_all())
+
+
+class CleanupHandler(webapp2.RequestHandler):
+  """Cleans up EntryPoint records."""
+
+  def get(self):
+    keep_cleaning = True
+    try:
+      content_list = EntryPoint.gql('ORDER BY last_updated').fetch(25)
+      keep_cleaning = (len(content_list) > 0)
+      db.delete(content_list)
+      
+      if content_list:
+        message = "Deleted %d entities" % len(content_list)
+      else:
+        keep_cleaning = False
+        message = "Done"
+    except (db.Error, apiproxy_errors.Error), e:
+      keep_cleaning = True
+      message = "%s: %s" % (e.__class__, e)
+
+    context = {  
+      'keep_cleaning': keep_cleaning,
+      'message': message,
+    }
+    self.response.out.write(template.render('cleanup.html', context))
+
+################################################################################
+
 app = webapp2.WSGIApplication([
   (r"/", HomeHandler),
   (r"/main", HomeHandler),
+  (r"/kaboom", KaboomHandler),
+  (r"/admin", AdminHandler),
+  (r"/cleanup", CleanupHandler),
   (r"/([^/]+).*", MirrorHandler)
 ], debug=DEBUG)
